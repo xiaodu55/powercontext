@@ -18,19 +18,145 @@ from __future__ import annotations
 
 import hashlib
 import io
+import itertools
+import math
+import re
 from urllib.parse import quote, unquote
 
-from pypdf import PdfReader
 from pydantic import BaseModel
+from pypdf import PdfReader
 
 from powercontext.builtin.artifacts.memory.models import MemoryCitation
-from powercontext.builtin.runtime.models import GetMemoryEntryRequest, SearchMemoryRequest
+from powercontext.builtin.runtime.models import GetMemoryEntryRequest, MemoryEntryRecord, SearchMemoryRequest
 from powercontext.limits import MAX_SOURCE_ID_LENGTH
 from powercontext.sources.models import Source, SourceMaterialization
 from powercontext.sources.projections import TEXT_EVIDENCE_PROJECTION_KEY, TextEvidence
 
 _PDF_PAGE_SOURCE_TYPE = "pdf-page"
 _IDENTITY_PREFIX = "pdf-page:"
+
+_SEARCH_POOL_FLOOR = 400
+_SEARCH_POOL_MULTIPLIER = 20
+_QUERY_TOKEN_PATTERN = re.compile(r"[a-z]+|\d+")
+_SEARCH_DIGIT_WEIGHT = 0.3
+_SEARCH_TABLE_FILLER = 10
+_SEARCH_NARRATIVE_FILLER = 4
+_SEARCH_NEIGHBOR_WINDOW = 3
+_NUMERIC_HINT_TOKENS = frozenset((
+    "ratio",
+    "margin",
+    "percent",
+    "percentage",
+    "growth",
+    "revenue",
+    "income",
+    "expense",
+    "cost",
+    "cash",
+    "debt",
+    "equity",
+    "asset",
+    "liability",
+    "sales",
+    "profit",
+    "earnings",
+    "dividend",
+    "spend",
+    "spending",
+    "ebitda",
+    "ebit",
+))
+_QUERY_STOP_TOKENS = frozenset((
+    "a",
+    "an",
+    "the",
+    "and",
+    "or",
+    "for",
+    "of",
+    "to",
+    "in",
+    "on",
+    "at",
+    "by",
+    "from",
+    "with",
+    "as",
+    "is",
+    "are",
+    "was",
+    "were",
+    "be",
+    "been",
+    "being",
+    "what",
+    "which",
+    "who",
+    "how",
+    "why",
+    "when",
+    "where",
+    "do",
+    "does",
+    "did",
+    "can",
+    "could",
+    "should",
+    "would",
+    "will",
+    "shall",
+    "may",
+    "might",
+    "must",
+    "that",
+    "this",
+    "these",
+    "those",
+    "it",
+    "its",
+    "their",
+    "there",
+    "than",
+    "then",
+    "so",
+    "such",
+    "not",
+    "no",
+    "but",
+    "if",
+    "into",
+    "about",
+    "over",
+    "under",
+    "between",
+    "during",
+    "each",
+    "any",
+    "all",
+    "have",
+    "has",
+    "had",
+    "having",
+    "he",
+    "she",
+    "they",
+    "them",
+    "we",
+    "us",
+    "our",
+    "you",
+    "your",
+    "i",
+    "me",
+    "my",
+    "also",
+    "more",
+    "most",
+    "much",
+    "many",
+    "other",
+    "able",
+))
 
 
 class PDFDocumentInput(BaseModel):
@@ -154,18 +280,49 @@ PDF_PAGE_SOURCE_DEFINITION = _PDFPageSourceDefinition()
 
 
 async def search_pdf_pages(memory, question: str, limit: int = 10) -> tuple[MemoryCitation, ...]:
-    """Search one scoped Memory for distinct evidence pages answering ``question``."""
+    """Search one scoped Memory for distinct evidence pages answering ``question``.
+
+    Candidates come from the full scoped entry list so retrieval does not
+    depend on lexical admission; pages are then ranked offline by
+    idf-weighted query-term coverage with a numeric-table bias, so a page
+    containing every query term once outranks boilerplate that repeats one
+    term and quantity questions can still surface statement tables whose
+    vocabulary never overlaps the question.
+    """
 
     if limit <= 0:
         return ()
     query = question.strip()
     if not query:
         return ()
-    pool = max(limit * 4, 64)
-    page = await memory.search(SearchMemoryRequest(query=query, mode="fts", limit=pool))
+    try:
+        listed = await memory.list()
+    except Exception:
+        listed = None
+    if listed is not None and listed.memory_ref is not None:
+        records = _scoped_page_records(listed)
+        if records:
+            ranked = _rank_page_records(records, query, limit)
+            return tuple(record.citation for record, _location in ranked[:limit])
+    return await _lexical_search_pages(memory, query, limit)
+
+
+def _scoped_page_records(listed) -> list[tuple[MemoryEntryRecord, tuple[str, int]]]:
+    records: list[tuple[MemoryEntryRecord, tuple[str, int]]] = []
+    for record in listed.entries:
+        locations = _entry_locations(record.entry)
+        if len(locations) == 1:
+            records.append((record, next(iter(locations))))
+    return records
+
+
+async def _lexical_search_pages(memory, query: str, limit: int) -> tuple[MemoryCitation, ...]:
+    pool = max(limit * _SEARCH_POOL_MULTIPLIER, _SEARCH_POOL_FLOOR)
+    result = await memory.search(SearchMemoryRequest(query=query, mode="fts", limit=pool))
+    ranked = _rank_page_hits(result.hits, query)
     citations: list[MemoryCitation] = []
     seen: set[tuple[str, int]] = set()
-    for hit in page.hits:
+    for hit in ranked:
         if len(citations) >= limit:
             break
         record = await memory.get(
@@ -177,11 +334,7 @@ async def search_pdf_pages(memory, question: str, limit: int = 10) -> tuple[Memo
                 )
             )
         )
-        locations: set[tuple[str, int]] = set()
-        for reference in record.entry.sources:
-            parsed = _parse_page_identity(reference.source_id)
-            if parsed is not None:
-                locations.add(parsed)
+        locations = _entry_locations(record.entry)
         if len(locations) != 1:
             continue
         location = next(iter(locations))
@@ -196,3 +349,230 @@ async def search_pdf_pages(memory, question: str, limit: int = 10) -> tuple[Memo
             )
         )
     return tuple(citations)
+
+
+def _entry_locations(entry) -> set[tuple[str, int]]:
+    locations: set[tuple[str, int]] = set()
+    for reference in entry.sources:
+        parsed = _parse_page_identity(reference.source_id)
+        if parsed is not None:
+            locations.add(parsed)
+    return locations
+
+
+def _rank_page_records(records, question: str, limit: int) -> list:
+    """Order (record, location) pairs by query-term coverage over all pages.
+
+    Idf comes from the scoped corpus itself, so shared boilerplate (the
+    company name on every page) counts little while distinctive terms
+    dominate. Numeric-flavored questions additionally favour dense data
+    tables, and the tail slots are reserved for the target document's
+    densest tables because financial-statement gold pages often share no
+    vocabulary with the question.
+    """
+
+    token_sets: list[frozenset[str]] = []
+    densities: list[float] = []
+    documents: list[str] = []
+    for record, (document_id, _page) in records:
+        text = record.entry.text
+        prefix = f"{document_id}\n"
+        if text.startswith(prefix):
+            text = text[len(prefix) :]
+        tokens = _QUERY_TOKEN_PATTERN.findall(text.lower())
+        stripped = [_strip_plural(token) for token in tokens]
+        digits = sum(1 for token in stripped if token.isdigit())
+        token_sets.append(frozenset(stripped))
+        densities.append(digits / len(stripped) if stripped else 0.0)
+        documents.append(document_id)
+    total = len(records)
+    query_tokens = _query_tokens(question)
+    if not query_tokens:
+        order = sorted(range(total), key=lambda i: (-densities[i], documents[i], records[i][1][1]))
+        return [records[i] for i in order]
+    query_set = set(query_tokens)
+    numeric = _is_numeric_question(question)
+    document_frequency: dict[str, int] = {}
+    for tokens in token_sets:
+        for token in query_set & tokens:
+            document_frequency[token] = document_frequency.get(token, 0) + 1
+    idf = {token: math.log(1.0 + total / (1.0 + document_frequency.get(token, 0))) for token in query_set}
+    denominator = sum(idf[token] for token in query_tokens) or 1.0
+    target = _infer_target_document(documents, token_sets, query_tokens, idf, denominator)
+    if target is not None:
+        keep = [index for index in range(total) if documents[index] == target]
+        # Second pass: idf within the target document, so terms that are
+        # boilerplate across the whole corpus (the company name) still
+        # discriminate between the target document's own pages.
+        target_frequency: dict[str, int] = {}
+        for index in keep:
+            for token in query_set & token_sets[index]:
+                target_frequency[token] = target_frequency.get(token, 0) + 1
+        idf = {token: math.log(1.0 + len(keep) / (1.0 + target_frequency.get(token, 0))) for token in query_set}
+    else:
+        keep = list(range(total))
+    scored = _score_pages(token_sets, densities, idf, query_tokens, keep, numeric)
+    return _select_page_records(records, scored, keep, densities, target, numeric, limit)
+
+
+def _infer_target_document(documents, token_sets, query_tokens, idf, denominator) -> str | None:
+    """Decide the question's target document, or ``None`` when ambiguous.
+
+    Affinity matches question tokens (and adjacent-token concatenations for
+    multi-word names) against the document ids; the per-document mean
+    coverage breaks ties. Only a strictly best affinity narrows retrieval to
+    that document.
+    """
+
+    affinity: dict[str, int] = {}
+    for document_id in set(documents):
+        flat_document = re.sub(r"[^a-z0-9]", "", document_id.lower())
+        score = 0
+        for token in query_tokens:
+            if len(token) >= 3 and re.search(r"[a-z]", token) and token in flat_document:
+                score += 1
+        for first, second in itertools.pairwise(query_tokens):
+            if len(first) + len(second) >= 6 and first + second in flat_document:
+                score += 3
+        affinity[document_id] = score
+    best_affinity = max(affinity.values(), default=0)
+    affinity_values = sorted(affinity.values(), reverse=True)
+    decisive = best_affinity > 0 and (len(affinity_values) < 2 or affinity_values[0] > affinity_values[1])
+    if not decisive:
+        return None
+    weight_sum: dict[str, float] = {}
+    page_count: dict[str, int] = {}
+    for index, tokens in enumerate(token_sets):
+        coverage = sum(idf[token] for token in query_tokens if token in tokens) / denominator
+        weight_sum[documents[index]] = weight_sum.get(documents[index], 0.0) + coverage
+        page_count[documents[index]] = page_count.get(documents[index], 0) + 1
+    return min(
+        (doc for doc, value in affinity.items() if value == best_affinity),
+        key=lambda doc: (-(weight_sum[doc] / page_count[doc]), doc),
+    )
+
+
+def _score_pages(token_sets, densities, idf, query_tokens, keep, numeric) -> list[tuple[float, float, int]]:
+    denominator = sum(idf[token] for token in query_tokens) or 1.0
+    digit_weight = _SEARCH_DIGIT_WEIGHT if numeric else 0.0
+    scored: list[tuple[float, float, int]] = []
+    for index in keep:
+        coverage = sum(idf[token] for token in query_tokens if token in token_sets[index]) / denominator
+        scored.append((-(coverage + digit_weight * densities[index]), -densities[index], index))
+    scored.sort()
+    return scored
+
+
+def _select_page_records(records, scored, keep, densities, target, numeric, limit) -> list:
+    picked: list[tuple[str, int]] = []
+    used_pages: set[int] = set()
+    filler = (
+        _SEARCH_TABLE_FILLER
+        if target is not None and numeric
+        else _SEARCH_NARRATIVE_FILLER
+        if target is not None
+        else 0
+    )
+    head = limit - filler
+    for _neg_score, _neg_density, index in scored:
+        if len(picked) >= head:
+            break
+        picked.append(records[index][1])
+        used_pages.add(records[index][1][1])
+    if target is not None and len(picked) < limit:
+        head_pages = [page for document, page in picked if document == target]
+        picked.extend(_neighbor_filler(records, keep, densities, target, used_pages, head_pages, limit - len(picked)))
+    order = {location: rank for rank, location in enumerate(picked)}
+    return sorted(records, key=lambda item: order.get(item[1], len(order)))
+
+
+def _neighbor_filler(records, keep, densities, target, used_pages, head_pages, slots) -> list[tuple[str, int]]:
+    """Pages adjacent to the head picks — closer pages first — because
+    financial-statement gold pages often sit next to the pages the query
+    vocabulary does reach."""
+
+    neighbors: set[tuple[int, int]] = set()
+    for base_page in head_pages:
+        for delta in range(1, _SEARCH_NEIGHBOR_WINDOW + 1):
+            neighbors.add((delta, base_page - delta))
+            neighbors.add((delta, base_page + delta))
+    filler: list[tuple[float, tuple[str, int]]] = []
+    for index in keep:
+        document, page = records[index][1]
+        if document != target or page in used_pages:
+            continue
+        if any(candidate == page for _delta, candidate in neighbors):
+            filler.append((-densities[index], records[index][1]))
+    filler.sort()
+    return [location for _density, location in filler[:slots]]
+
+
+def _is_numeric_question(question: str) -> bool:
+    lowered = question.lower()
+    if re.search(r"\d", lowered) or "%" in lowered:
+        return True
+    tokens = {_strip_plural(token) for token in _QUERY_TOKEN_PATTERN.findall(lowered)}
+    if tokens & _NUMERIC_HINT_TOKENS:
+        return True
+    return "how much" in lowered or "how many" in lowered
+
+
+def _strip_plural(word: str) -> str:
+    if word.endswith("ies") and len(word) > 4:
+        return word[:-3] + "y"
+    if word.endswith("es") and len(word) > 5:
+        return word[:-2]
+    if word.endswith("s") and not word.endswith("ss") and len(word) > 3:
+        return word[:-1]
+    return word
+
+
+def _query_tokens(question: str) -> tuple[str, ...]:
+    """Content tokens of the question, plural-normalized to match pages."""
+
+    seen: set[str] = set()
+    tokens: list[str] = []
+    for token in _QUERY_TOKEN_PATTERN.findall(question.lower()):
+        if token in _QUERY_STOP_TOKENS or token in seen:
+            continue
+        seen.add(token)
+        tokens.append(_strip_plural(token))
+    return tuple(tokens)
+
+
+def _rank_page_hits(hits, question: str) -> list:
+    """Order candidate hits by idf-weighted query-term coverage over page text.
+
+    Idf comes from the candidate pool itself, so shared boilerplate terms (the
+    company name on every page) count little while terms that distinguish the
+    requested content dominate. The lexical score is normalized by the total
+    query weight so pages covering all terms once beat pages repeating one.
+    """
+
+    hits = list(hits)
+    if not hits:
+        return []
+    query_tokens = _query_tokens(question)
+    if not query_tokens:
+        return sorted(hits, key=lambda hit: (-hit.score, hit.entry_id))
+    query_set = set(query_tokens)
+    page_tokens: list[frozenset[str]] = []
+    document_frequency: dict[str, int] = {}
+    for hit in hits:
+        tokens = frozenset(_QUERY_TOKEN_PATTERN.findall(hit.text.lower()))
+        page_tokens.append(tokens)
+        for token in query_set & tokens:
+            document_frequency[token] = document_frequency.get(token, 0) + 1
+    total = len(hits)
+    idf = {token: math.log(1.0 + total / (1.0 + document_frequency.get(token, 0))) for token in query_set}
+    denominator = sum(idf[token] for token in query_tokens) or 1.0
+    scored: list[tuple[float, float, int, object]] = []
+    for index, (hit, tokens) in enumerate(zip(hits, page_tokens, strict=True)):
+        coverage = 0.0
+        for token in query_tokens:
+            if token in tokens:
+                coverage += idf[token]
+        coverage /= denominator
+        scored.append((-coverage, -hit.score, index, hit))
+    scored.sort(key=lambda item: item[:3])
+    return [item[3] for item in scored]
