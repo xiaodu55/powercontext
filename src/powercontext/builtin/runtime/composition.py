@@ -656,6 +656,13 @@ async def open_builtin_runtime(
         runtime.artifact_processing_supervisor = await resources.enter_async_context(
             _open_artifact_processing_supervisor(config, contexts, processing_bindings, tracing=tracing)
         )
+        from powercontext.builtin.runtime.source_lifecycle import (
+            LifecycleTopicMemoryProxy,
+            SourceLifecycleFactory,
+        )
+
+        runtime.lifecycle = SourceLifecycleFactory(runtime=runtime, database=config.database)
+        runtime.topic_memory = LifecycleTopicMemoryProxy(runtime.topic_memory, runtime.lifecycle)
         contexts.profiles.operation_context = runtime._operation
         if config.handoff_report.enabled:
             runtime.handoff_report = HandoffReportApplication(
