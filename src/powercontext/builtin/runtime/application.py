@@ -2892,6 +2892,100 @@ class ScheduledSourceProcessor:
                             })
 
 
+class SourceCountTriggerProcessor:
+    """Admit one scheduled processing call when pending Source counts reach thresholds.
+
+    Pending counts are journal positions per scope and family: entries after the
+    family's last successful cursor. Reaching a threshold runs the same explicit
+    processing call the schedule would run; the next poll re-evaluates what is
+    left, so a single threshold crossing never drains the whole journal.
+    """
+
+    _POLL_SECONDS = 0.25
+
+    def __init__(
+        self,
+        runtime: BuiltinRuntime,
+        scope_ids: ScopeIds,
+        *,
+        memory_threshold: int | None,
+        topic_memory_threshold: int | None,
+        journal_head_reader: Callable[[str], Awaitable[int]],
+        topic_cursor_reader: Callable[[str], Awaitable[int]],
+    ) -> None:
+        self._runtime = runtime
+        self._scope_ids = scope_ids
+        self._memory_threshold = memory_threshold
+        self._topic_memory_threshold = topic_memory_threshold
+        self._journal_head_reader = journal_head_reader
+        self._topic_cursor_reader = topic_cursor_reader
+        self._in_flight: set[tuple[str, str]] = set()
+        self._task: asyncio.Task[None] | None = None
+
+    def start(self) -> None:
+        if self._task is None:
+            self._task = asyncio.create_task(self._loop())
+
+    def stop(self) -> None:
+        task, self._task = self._task, None
+        if task is not None:
+            task.cancel()
+
+    async def _loop(self) -> None:
+        while True:
+            try:
+                await self._check()
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                log_safely(
+                    logger,
+                    logging.WARNING,
+                    "Source count trigger check failed",
+                    exc_info=error,
+                    extra={"event": "processing.count_trigger.check_failed", "outcome": "failure"},
+                )
+            await asyncio.sleep(self._POLL_SECONDS)
+
+    async def _check(self) -> None:
+        if self._runtime._closing or self._runtime._closed:
+            return
+        for scope_id in await self._scope_ids():
+            if self._runtime._closing or self._runtime._closed:
+                return
+            head = await self._journal_head_reader(scope_id)
+            if self._memory_threshold is not None:
+                await self._check_memory(scope_id, head)
+            if self._topic_memory_threshold is not None:
+                await self._check_topic(scope_id, head)
+
+    async def _check_memory(self, scope_id: str, head: int) -> None:
+        key = (scope_id, "memory")
+        if key in self._in_flight:
+            return
+        cursor = await self._runtime.memory.for_scope(scope_id).cursor()
+        if head - cursor.sequence < (self._memory_threshold or 0):
+            return
+        self._in_flight.add(key)
+        try:
+            await self._runtime.memory.for_scope(scope_id).flush()
+        finally:
+            self._in_flight.discard(key)
+
+    async def _check_topic(self, scope_id: str, head: int) -> None:
+        key = (scope_id, "topic-memory")
+        if key in self._in_flight:
+            return
+        cursor = await self._topic_cursor_reader(scope_id)
+        if head - cursor < (self._topic_memory_threshold or 0):
+            return
+        self._in_flight.add(key)
+        try:
+            await self._runtime.topic_memory.for_scope(scope_id).flush()
+        finally:
+            self._in_flight.discard(key)
+
+
 class ScheduledExperienceProcessor:
     """Map APScheduler activations to scoped Experience incubation windows."""
 

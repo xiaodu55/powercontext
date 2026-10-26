@@ -656,6 +656,42 @@ async def open_builtin_runtime(
         runtime.artifact_processing_supervisor = await resources.enter_async_context(
             _open_artifact_processing_supervisor(config, contexts, processing_bindings, tracing=tracing)
         )
+        if (
+            config.runtime.memory_source_count_threshold is not None
+            or config.runtime.topic_memory_source_count_threshold is not None
+        ):
+            from powercontext.builtin.artifacts.topic_memory import TOPIC_MEMORY_SOURCE_WINDOW_BINDING
+            from powercontext.builtin.persistence.cursors import SourceCursorRepository
+            from powercontext.builtin.persistence.processing import SOURCE_JOURNAL_HEADS_TABLE
+            from powercontext.builtin.runtime.application import SourceCountTriggerProcessor
+            from sqlalchemy import select
+
+            async def read_source_journal_head(scope_id: str) -> int:
+                async with contexts.database.transaction() as connection:
+                    head = await connection.scalar(
+                        select(SOURCE_JOURNAL_HEADS_TABLE.c.position).where(
+                            SOURCE_JOURNAL_HEADS_TABLE.c.scope_id == scope_id
+                        )
+                    )
+                return 0 if head is None else int(head)
+
+            async def read_topic_memory_cursor(scope_id: str) -> int:
+                async with contexts.database.transaction() as connection:
+                    cursor = await SourceCursorRepository().load(
+                        connection, scope_id, TOPIC_MEMORY_SOURCE_WINDOW_BINDING
+                    )
+                return 0 if cursor is None else cursor.cursor.sequence
+
+            trigger = SourceCountTriggerProcessor(
+                runtime,
+                contexts.scope_ids,
+                memory_threshold=config.runtime.memory_source_count_threshold,
+                topic_memory_threshold=config.runtime.topic_memory_source_count_threshold,
+                journal_head_reader=read_source_journal_head,
+                topic_cursor_reader=read_topic_memory_cursor,
+            )
+            trigger.start()
+            resources.callback(trigger.stop)
         from powercontext.builtin.runtime.source_lifecycle import (
             LifecycleTopicMemoryProxy,
             SourceLifecycleFactory,
@@ -726,6 +762,16 @@ def _artifact_processing_bindings(  # noqa: C901 - validate and assemble one reg
         "profile": config.runtime.profile_schedule_enabled or None,
         "skill": None,
     }
+    count_gated = {
+        "memory": config.runtime.memory_source_count_threshold is not None,
+        "topic-memory": config.runtime.topic_memory_source_count_threshold is not None,
+    }
+    for family, gated in count_gated.items():
+        if gated and family not in declared | registered:
+            if family not in automatic or automatic[family] is not None:
+                continue
+            issue = {"memory": "scheduled-pipeline", "topic-memory": "topic-memory-generation"}[family]
+            raise BuiltinConfigurationError(issue)
     for family, schedule in automatic.items():
         if schedule is not None and family not in declared | registered:
             if (
