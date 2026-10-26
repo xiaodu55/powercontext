@@ -146,6 +146,7 @@ class MemorySearchRequest(BaseModel):
     query_vector: EmbeddingVector | None = None
     embedding_profile: EmbeddingProfile | None = None
     tag_filter: TagFilter | None = None
+    fts_prefix_fallback: bool = False
 
 
 class MemorySearchChannels(BaseModel):

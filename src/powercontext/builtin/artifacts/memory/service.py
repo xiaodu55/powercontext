@@ -758,6 +758,18 @@ class MemoryService:
         )
         channels = await self._backend.search(request)
         admitted_fts = admit_fts_candidates(normalized_query, channels.fts, admission=admission)
+        if not admitted_fts and selected_mode in {"fts", "hybrid"} and request.analyzed_query:
+            # Morphology the analyzer does not stem (myelin vs myelinated) can
+            # leave the lexical channel empty; fall back to prefix matching
+            # before giving up on a non-empty corpus.
+            admitted_fts = admit_fts_candidates(normalized_query, channels.fts, admission=admission, prefix=True)
+            if not admitted_fts:
+                prefix_channels = await self._backend.search(request.model_copy(update={"fts_prefix_fallback": True}))
+                admitted_fts = admit_fts_candidates(
+                    normalized_query, prefix_channels.fts, admission=admission, prefix=True
+                )
+                if admitted_fts:
+                    channels = prefix_channels
         admitted_vector = admit_vector_candidates(channels.vector, admission=admission)
         hits = fuse_rankings(
             fts=admitted_fts if selected_mode in {"fts", "hybrid"} else (),

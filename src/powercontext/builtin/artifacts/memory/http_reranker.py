@@ -57,9 +57,7 @@ class HTTPMemoryReranker:
             batch = candidates[start : start + self._batch_size]
             payload = {
                 "query": query,
-                "candidates": [
-                    {"rank": start + index + 1, "text": hit.text} for index, hit in enumerate(batch)
-                ],
+                "candidates": [{"rank": start + index + 1, "text": hit.text} for index, hit in enumerate(batch)],
             }
             requests += 1
             response = await self._client.post(self._endpoint, json=payload)

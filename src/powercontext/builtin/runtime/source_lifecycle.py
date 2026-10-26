@@ -22,7 +22,6 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, field_validator
 
 from powercontext.artifacts import ArtifactRef
-from powercontext.limits import MAX_SOURCE_ID_LENGTH
 from powercontext.sources.models import SourceRef
 
 
@@ -58,13 +57,14 @@ class SourceLifecycleEvent(BaseModel):
 
 class _LifecycleNode:
     __slots__ = (
-        "node_id",
+        "available",
         "kind",
-        "policy",
+        "node_id",
         "parents",
+        "policy",
         "reference",
         "revision",
-        "available",
+        "synced",
     )
 
     def __init__(
@@ -77,6 +77,7 @@ class _LifecycleNode:
         policy: str | None = None,
         parents: tuple[str, ...] = (),
         revision: int | None = None,
+        synced: bool | None = None,
     ) -> None:
         self.node_id = node_id
         self.kind = kind
@@ -85,6 +86,10 @@ class _LifecycleNode:
         self.reference = reference
         self.revision = revision
         self.available = available
+        # Memory nodes only: whether the native entry state currently reflects
+        # ``available``. ``None`` means "not confirmed yet" and forces one sync
+        # pass so interrupted propagations complete on retry.
+        self.synced = synced
 
 
 def _persist_path(database: Any) -> str | None:
@@ -93,7 +98,7 @@ def _persist_path(database: Any) -> str | None:
         return None
     prefix = "sqlite+aiosqlite:///"
     if url.startswith(prefix):
-        return url[len(prefix):].rstrip("/") + ".lifecycle.json"
+        return url[len(prefix) :].rstrip("/") + ".lifecycle.json"
     return None
 
 
@@ -128,6 +133,7 @@ class SourceLifecycleFactory:
                     policy=node_data.get("policy"),
                     parents=tuple(node_data.get("parents", ())),
                     revision=node_data.get("revision"),
+                    synced=node_data.get("synced"),
                 )
             for event_key, event_data in payload.get("events", {}).items():
                 node_id, sequence = event_key.rsplit(":", 1)
@@ -145,6 +151,7 @@ class SourceLifecycleFactory:
                 "reference": node.reference,
                 "revision": node.revision,
                 "available": node.available,
+                "synced": node.synced,
             }
         for (scope_id, node_id, sequence), event in self._events.items():
             scopes.setdefault(scope_id, {"nodes": {}, "events": {}})["events"][f"{node_id}:{sequence}"] = event
@@ -161,7 +168,7 @@ class SourceLifecycleFactory:
 
     def topic_artifact_available(self, scope_id: str, artifact_id: str, /) -> bool:
         self._ensure_loaded()
-        for (scope, node_id), node in self._nodes.items():
+        for (scope, _node_id), node in self._nodes.items():
             if scope == scope_id and node.kind == "topic" and node.reference.get("artifact_id") == artifact_id:
                 return node.available
         return True
@@ -170,11 +177,7 @@ class SourceLifecycleFactory:
         self._nodes[(scope_id, node.node_id)] = node
 
     def node_states(self, scope_id: str) -> dict[str, _LifecycleNode]:
-        return {
-            node_id: node
-            for (scope, node_id), node in self._nodes.items()
-            if scope == scope_id
-        }
+        return {node_id: node for (scope, node_id), node in self._nodes.items() if scope == scope_id}
 
 
 class _SourceLifecycleService:
@@ -200,12 +203,48 @@ class _SourceLifecycleService:
             return MemoryCitation.model_validate(reference)
         return ArtifactRef.model_validate(reference)
 
+    # -------------------------------------------------------------- validation
+
+    async def _verify_source(self, source_ref: SourceRef, /) -> None:
+        try:
+            await self._runtime.records.for_scope(self.scope_id).get_source(
+                source_ref.source_type, source_ref.source_id
+            )
+        except Exception as error:
+            raise SourceLifecycleError("source reference is not readable") from error
+
+    async def _verify_memory_citation(self, citation: Any, /) -> None:
+        from powercontext.builtin.runtime.application import (
+            ModelUsagePurpose,
+            _head_or_none,
+        )
+
+        async with (
+            self._runtime._context(self.scope_id, embedding_purpose=ModelUsagePurpose.MEMORY_INDEXING) as context,
+            self._runtime._locked(self.scope_id),
+        ):
+            service = context.artifacts.memory
+            current = await _head_or_none(service, context.artifacts.memory_artifact_id)
+            if current is None:
+                raise SourceLifecycleError("memory artifact is not readable")
+            if all(item.entry_id != citation.entry_id for item in current.content.manifest.entries):
+                raise SourceLifecycleError(f"memory entry {citation.entry_id!r} is not readable")
+
+    async def _verify_topic_reference(self, artifact_ref: ArtifactRef, /) -> None:
+        try:
+            await self._runtime.records.for_scope(self.scope_id).get_artifact_revision(
+                artifact_ref.family, artifact_ref.artifact_id, artifact_ref.revision
+            )
+        except Exception as error:
+            raise SourceLifecycleError(f"topic artifact {artifact_ref.artifact_id!r} is not readable") from error
+
     # ----------------------------------------------------------- registration
 
     async def register_source(self, node_id: str, source_ref: SourceRef, /, *, revision: int) -> None:
         self._factory._ensure_loaded()
         if revision <= 0:
             raise SourceLifecycleError("source lifecycle revision must be positive")
+        await self._verify_source(source_ref)
         nodes = self._nodes()
         existing = nodes.get(node_id)
         reference = source_ref.model_dump(mode="json")
@@ -232,10 +271,10 @@ class _SourceLifecycleService:
         parents: tuple[str, ...],
         policy: str,
     ) -> None:
+        await self._verify_memory_citation(citation)
         await self._register_derived(node_id, "memory", citation.model_dump(mode="json"), parents, policy)
         node = self._nodes()[node_id]
-        if not node.available:
-            await self._apply_memory_state(citation, active=False, reason="registered without full support")
+        await self._sync_memory_node(node, reason="registered without full support")
         self._factory._flush()
 
     async def register_topic(
@@ -247,6 +286,7 @@ class _SourceLifecycleService:
         parents: tuple[str, ...],
         policy: str,
     ) -> None:
+        await self._verify_topic_reference(artifact_ref)
         await self._register_derived(node_id, "topic", artifact_ref.model_dump(mode="json"), parents, policy)
         self._factory._flush()
 
@@ -334,35 +374,46 @@ class _SourceLifecycleService:
                 raise SourceLifecycleError("dependency graph must be acyclic")
         return flips
 
+    async def _sync_memory_node(self, node: _LifecycleNode, /, *, reason: str) -> None:
+        """Bring one memory node's native entry state in line with its availability.
+
+        Skips nodes that are already confirmed in sync so replaying a successful
+        event never creates new native Memory revisions; re-issues the native
+        write for nodes an interrupted run left behind.
+        """
+
+        if node.kind != "memory" or node.synced is node.available:
+            return
+        citation = self._reference_model(node)
+        await self._apply_memory_state(citation, active=node.available, reason=reason)
+        node.synced = node.available
+
     async def _apply_memory_state(self, citation: Any, /, *, active: bool, reason: str) -> None:
         from powercontext.builtin.runtime.application import (
             ModelUsagePurpose,
             _head_or_none,
         )
 
-        async with self._runtime._context(self.scope_id, embedding_purpose=ModelUsagePurpose.MEMORY_INDEXING) as context:
-            async with self._runtime._locked(self.scope_id):
-                service = context.artifacts.memory
-                current = await _head_or_none(service, context.artifacts.memory_artifact_id)
-                if current is None:
-                    return
-                target_state = "active" if active else "inactive"
-                manifest_entry = next(
-                    (
-                        item
-                        for item in current.content.manifest.entries
-                        if item.entry_id == citation.entry_id
-                    ),
-                    None,
-                )
-                if manifest_entry is None or manifest_entry.state == target_state:
-                    return
-                entries = await service.entries(current)
-                entry = next(item for item in entries if item.entry_id == citation.entry_id)
-                if active:
-                    await service.reactivate(current, entries=(entry,), reason=reason)
-                else:
-                    await service.forget(current, entries=(entry,), reason=reason)
+        async with self._runtime._context(
+            self.scope_id, embedding_purpose=ModelUsagePurpose.MEMORY_INDEXING
+        ) as context, self._runtime._locked(self.scope_id):
+            service = context.artifacts.memory
+            current = await _head_or_none(service, context.artifacts.memory_artifact_id)
+            if current is None:
+                return
+            target_state = "active" if active else "inactive"
+            manifest_entry = next(
+                (item for item in current.content.manifest.entries if item.entry_id == citation.entry_id),
+                None,
+            )
+            if manifest_entry is None or manifest_entry.state == target_state:
+                return
+            entries = await service.entries(current)
+            entry = next(item for item in entries if item.entry_id == citation.entry_id)
+            if active:
+                await service.reactivate(current, entries=(entry,), reason=reason)
+            else:
+                await service.forget(current, entries=(entry,), reason=reason)
 
     async def apply(self, event: SourceLifecycleEvent) -> list[str]:
         self._factory._ensure_loaded()
@@ -383,6 +434,10 @@ class _SourceLifecycleService:
                 or applied["reason"] != event.reason
             ):
                 raise SourceLifecycleError("event sequence was already applied with different content")
+            # Idempotent replay: logical state stays as recorded. Native writes that
+            # a previous interrupted run left behind are completed by the sync loop
+            # below, while fully synced nodes produce no native calls (and therefore
+            # no new Memory revisions).
         else:
             for (scope, node_id, sequence), record in self._factory._events.items():
                 if scope == self.scope_id and node_id == event.node_id and sequence >= event.sequence:
@@ -392,17 +447,13 @@ class _SourceLifecycleService:
                 "available": event.available,
                 "reason": event.reason,
             }
-        node.available = event.available
-        flips = self._compute_flips(nodes)
-        for node, computed in flips:
-            nodes[node.node_id].available = computed
-            if node.kind == "memory":
-                citation = self._reference_model(node)
-                await self._apply_memory_state(
-                    citation,
-                    active=computed,
-                    reason=event.reason,
-                )
+            node.available = event.available
+            flips = self._compute_flips(nodes)
+            for flipped, computed in flips:
+                nodes[flipped.node_id].available = computed
+            self._factory._flush()
+        for node_id in sorted(nodes):
+            await self._sync_memory_node(nodes[node_id], reason=event.reason)
         self._factory._flush()
         return sorted(node_id for node_id, node in nodes.items() if node.available)
 

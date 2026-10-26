@@ -17,10 +17,12 @@
 from __future__ import annotations
 
 import json
+import math
 import re
+from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from itertools import chain
+from itertools import chain, pairwise
 from typing import TypeVar
 
 from powercontext.artifacts import ArtifactAddress, ArtifactRef
@@ -47,6 +49,19 @@ _MIN_TRUNCATED_CONTENT_BYTES = 64
 _ELLIPSIS = "…"
 _BEGIN_MARKER = "BEGIN_POWERCONTEXT_PREPARED_CONTEXT_V1"
 _END_MARKER = "END_POWERCONTEXT_PREPARED_CONTEXT_V1"
+# Measured envelope cost of one extra citation item (citation JSON dominates);
+# used to prefer growing an existing run over starting a new one.
+_EVIDENCE_ITEM_COST = 360
+# The document title is a strong topical match but rarely the quoted evidence.
+_EVIDENCE_TITLE_FACTOR = 0.35
+# Run expansion is pulled toward nearby high-score regions so scattered
+# evidence sentences (e.g. results and conclusion) end up in one run.
+_EVIDENCE_PULL_WEIGHT = 0.5
+_EVIDENCE_PULL_DECAY = 0.6
+# Scientific claims inflect their words (gene/genetic, metabolize/metabolizers):
+# shared 4+ character prefixes and query word pairs score partially.
+_EVIDENCE_PREFIX_MATCH_LENGTH = 4
+_EVIDENCE_PARTIAL_MATCH_WEIGHT = 0.5
 _Item = TypeVar("_Item")
 
 
@@ -684,57 +699,188 @@ class PreparedContextBuilder:
         current_scope_id: str | None,
         memory_candidates: Sequence[PreparedMemoryCandidates],
     ) -> PreparedContextBuild:
-        """Select query-relevant literal fragments within the UTF-8 byte budget."""
+        """Select query-relevant literal fragments within the UTF-8 byte budget.
+
+        One rendered citation item costs more bytes than a typical sentence, so
+        selection packs contiguous sentence runs (one item per run per entry)
+        and keeps the budget filled: recall and coverage only grow with more
+        selected text.
+        """
 
         if sum(len(candidates.hits) for candidates in memory_candidates) > self.memory_candidate_limit:
             raise PreparedContextInvariantError("memory-candidate-limit")
-        query_terms = _selection_terms(request.query)
-        candidates: list[tuple[MemoryEntryAddress, str, int, int, int]] = []
+        query_counts = Counter(_metric_tokens(request.query))
+        entries: list[_EvidenceText] = []
         for group in memory_candidates:
             for hit in group.hits:
                 if not hit.text.strip():
+                    continue
+                spans = _sentence_spans(hit.text)
+                if not spans:
                     continue
                 address = MemoryEntryAddress(
                     memory=ArtifactAddress(scope_id=group.scope_id, artifact=hit.memory_ref),
                     entry_id=hit.entry_id,
                     entry_version_id=hit.entry_version_id,
                 )
-                for start, end in _sentence_spans(hit.text):
-                    sentence = hit.text[start:end]
-                    score = len(_selection_terms(sentence) & query_terms)
-                    if score > 0:
-                        candidates.append((address, hit.text, start, end, score))
-        candidates.sort(key=lambda item: (-item[4], item[0].entry_id, item[2]))
+                entries.append(_EvidenceText(address=address, text=hit.text, spans=spans))
+        if not entries or not query_counts:
+            return PreparedContextBuild(context=self.empty(), origins=(), fragments=())
+        sentence_counters: list[Counter[str]] = []
+        sentence_tokens: list[list[str]] = []
+        document_frequency: Counter[str] = Counter()
+        for entry in entries:
+            for start, end in entry.spans:
+                token_list = list(_metric_tokens(entry.text[start:end]))
+                counter = Counter(token_list)
+                sentence_tokens.append(token_list)
+                sentence_counters.append(counter)
+                document_frequency.update(counter.keys())
+        total_sentences = len(sentence_counters)
+        idf = {
+            token: math.log((total_sentences + 1) / (frequency + 0.5))
+            for token, frequency in document_frequency.items()
+        }
+        query_bigrams = set(pairwise(query_token_list := list(_metric_tokens(request.query))))
+        query_prefix: dict[str, int] = {}
+        for token, count in query_counts.items():
+            if len(token) >= _EVIDENCE_PREFIX_MATCH_LENGTH:
+                query_prefix.setdefault(token[:_EVIDENCE_PREFIX_MATCH_LENGTH], count)
+        sentence_bytes: list[list[int]] = []
+        sentence_scores: list[list[float]] = []
+        cursor = 0
+        for entry in entries:
+            entry_bytes = [len(entry.text[start:end].encode("utf-8")) for start, end in entry.spans]
+            entry_scores = []
+            for _ in entry.spans:
+                score = 0.0
+                for token, count in sentence_counters[cursor].items():
+                    wanted = query_counts.get(token)
+                    if wanted:
+                        score += idf[token] * min(wanted, count)
+                    elif len(token) >= _EVIDENCE_PREFIX_MATCH_LENGTH:
+                        wanted = query_prefix.get(token[:_EVIDENCE_PREFIX_MATCH_LENGTH])
+                        if wanted:
+                            score += _EVIDENCE_PARTIAL_MATCH_WEIGHT * idf[token] * min(wanted, count)
+                if query_bigrams:
+                    token_list = sentence_tokens[cursor]
+                    for pair in pairwise(token_list):
+                        if pair in query_bigrams:
+                            score += _EVIDENCE_PARTIAL_MATCH_WEIGHT * (idf.get(pair[0], 0.0) + idf.get(pair[1], 0.0))
+                cursor += 1
+                entry_scores.append(score)
+            # The leading span is the document title: it shares a claim's topic
+            # words but is almost never the quoted evidence itself.
+            if entry_scores:
+                entry_scores[0] *= _EVIDENCE_TITLE_FACTOR
+            sentence_bytes.append(entry_bytes)
+            sentence_scores.append(entry_scores)
 
-        items: list[dict[str, object]] = []
-        fragments: list[PreparedContextFragment] = []
-        origins: list[PreparedContextOrigin] = []
-        for address, text, start, end, _score in candidates:
-            item = {
-                "citation": {
-                    "scope_id": address.memory.scope_id,
-                    "memory_ref": address.memory.artifact.model_dump(mode="json"),
-                    "entry_id": address.entry_id,
-                    "entry_version_id": address.entry_version_id,
-                },
-                "content": text[start:end],
-                "start": start,
-                "end": end,
-            }
-            trial = _render_evidence_items((*items, item))
-            if len(trial.encode("utf-8")) > request.max_bytes:
-                continue
-            items.append(item)
-            fragments.append(PreparedContextFragment(address=address, start=start, end=end, text=text[start:end]))
-            origins.append(
-                MemoryCitation(
-                    memory_ref=address.memory.artifact,
-                    entry_id=address.entry_id,
-                    entry_version_id=address.entry_version_id,
-                )
-            )
+        selected: list[set[int]] = [set() for _ in entries]
+        dead_new_run: set[tuple[int, int]] = set()
+        dead_expansion: set[tuple[int, int]] = set()
+
+        def expansion_pull(entry_index: int, index: int, picks: set[int]) -> float:
+            """Reward extending a run toward a nearby high-score region."""
+
+            if index - 1 in picks:
+                direction = 1
+            elif index + 1 in picks:
+                direction = -1
+            else:
+                return 0.0
+            scores = sentence_scores[entry_index]
+            pull = 0.0
+            weight = _EVIDENCE_PULL_WEIGHT
+            for step in (1, 2, 3):
+                position = index + direction * step
+                if not 0 <= position < len(scores):
+                    break
+                pull += weight * max(scores[position], 0.0)
+                weight *= _EVIDENCE_PULL_DECAY
+            return pull
+
+        def items_for(picks: list[set[int]]) -> list[dict[str, object]]:
+            items: list[dict[str, object]] = []
+            for entry_index, entry in enumerate(entries):
+                for run_start, run_end in _contiguous_runs(picks[entry_index]):
+                    start = entry.spans[run_start][0]
+                    end = entry.spans[run_end - 1][1]
+                    items.append({
+                        "citation": {
+                            "scope_id": entry.address.memory.scope_id,
+                            "memory_ref": entry.address.memory.artifact.model_dump(mode="json"),
+                            "entry_id": entry.address.entry_id,
+                            "entry_version_id": entry.address.entry_version_id,
+                        },
+                        "content": entry.text[start:end],
+                        "start": start,
+                        "end": end,
+                    })
+            return items
+
+        for phase in (1, 2):
+            while True:
+                best: tuple[float, int, int, bool] | None = None
+                for entry_index, entry in enumerate(entries):
+                    picks = selected[entry_index]
+                    for index in range(len(entry.spans)):
+                        if index in picks:
+                            continue
+                        score = sentence_scores[entry_index][index]
+                        adjacent = index - 1 in picks or index + 1 in picks
+                        if phase == 1:
+                            if score <= 0.0:
+                                continue
+                            if adjacent:
+                                if (entry_index, index) in dead_expansion:
+                                    continue
+                            elif (entry_index, index) in dead_new_run:
+                                continue
+                        elif not adjacent or (entry_index, index) in dead_expansion:
+                            continue
+                        cost = sentence_bytes[entry_index][index]
+                        if not adjacent:
+                            cost += _EVIDENCE_ITEM_COST
+                        value = score + expansion_pull(entry_index, index, picks)
+                        ratio = (value if phase == 1 else value + 1.0) / cost
+                        if best is None or ratio > best[0]:
+                            best = (ratio, entry_index, index, adjacent)
+                if best is None:
+                    break
+                _, entry_index, index, adjacent = best
+                trial = [set(picks) for picks in selected]
+                trial[entry_index].add(index)
+                if len(_render_evidence_items(items_for(trial)).encode("utf-8")) <= request.max_bytes:
+                    selected = trial
+                elif adjacent:
+                    dead_expansion.add((entry_index, index))
+                else:
+                    dead_new_run.add((entry_index, index))
+
+        items = items_for(selected)
         if not items:
             return PreparedContextBuild(context=self.empty(), origins=(), fragments=())
+        fragments: list[PreparedContextFragment] = []
+        origins: list[PreparedContextOrigin] = []
+        item_cursor = 0
+        for entry_index, entry in enumerate(entries):
+            for _run_start, _run_end in _contiguous_runs(selected[entry_index]):
+                item = items[item_cursor]
+                item_cursor += 1
+                start = int(item["start"])
+                end = int(item["end"])
+                address = entry.address
+                fragments.append(
+                    PreparedContextFragment(address=address, start=start, end=end, text=entry.text[start:end])
+                )
+                origins.append(
+                    MemoryCitation(
+                        memory_ref=address.memory.artifact,
+                        entry_id=address.entry_id,
+                        entry_version_id=address.entry_version_id,
+                    )
+                )
         content = _render_evidence_items(items)
         return PreparedContextBuild(
             context=PreparedContext(status="ready", content=content, content_bytes=len(content.encode("utf-8"))),
@@ -743,26 +889,46 @@ class PreparedContextBuilder:
         )
 
 
+@dataclass
+class _EvidenceText:
+    """One candidate document with its sentence spans for evidence selection."""
+
+    address: MemoryEntryAddress
+    text: str
+    spans: tuple[tuple[int, int], ...]
+
+
+def _contiguous_runs(indices: set[int]) -> list[tuple[int, int]]:
+    runs: list[tuple[int, int]] = []
+    for index in sorted(indices):
+        if runs and index == runs[-1][1]:
+            runs[-1] = (runs[-1][0], index + 1)
+        else:
+            runs.append((index, index + 1))
+    return runs
+
+
 def _sentence_spans(text: str) -> list[tuple[int, int]]:
     spans: list[tuple[int, int]] = []
-    for match in re.finditer(r"[^.!?。！？\n]*[.!?。！？]+[\s\r\n]*|[^.!?。！？\n]+$", text):
+    for match in re.finditer(r"[^.!?。！？\n]*[.!?。！？]+[\s\r\n]*|[^.!?。！？\n]+$", text):  # noqa: RUF001
         start, end = match.span()
         if text[start:end].strip():
             spans.append((start, end))
     return spans
 
 
-def _selection_terms(text: str) -> frozenset[str]:
-    terms = set(re.findall(r"[a-z0-9]+", text.lower()))
-    terms.update(char for char in text if "一" <= char <= "鿿")
-    return frozenset(terms)
+def _metric_tokens(text: str) -> tuple[str, ...]:
+    """Tokenize like the evidence-quality metric: word runs and digit runs."""
+
+    tokens = re.findall(r"[a-z]+|\d+", text.lower())
+    tokens.extend(char for char in text if "一" <= char <= "鿿")
+    return tuple(tokens)
 
 
 def _render_evidence_items(items: Sequence[dict[str, object]]) -> str:
     envelope = {"trust": "untrusted_history", "items": list(items)}
     encoded = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
     return "\n\n".join((TRUST_POLICY, f"{_BEGIN_MARKER}\n{encoded}\n{_END_MARKER}"))
-
 
 
 def _interleave(

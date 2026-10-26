@@ -22,6 +22,7 @@ import unicodedata
 from dataclasses import dataclass
 from itertools import pairwise
 
+_FTS_PREFIX_MATCH_MIN_LENGTH = 3
 _FTS_MIN_QUERY_COVERAGE = 0.25
 _FTS_MIN_MATCHED_TERMS = 2
 _FTS_SHORT_QUERY_MAX_TERMS = 2
@@ -258,13 +259,35 @@ def fts_query_requirements(value: str, /, *, floor: AdmissionFloor | None = None
     return query_terms, required_matches
 
 
-def fts_match_query(value: str) -> str | None:
-    """Build a MATCH expression solely from normalized lexical query tokens."""
+def fts_match_query(value: str, /, *, prefix: bool = False) -> str | None:
+    """Build a MATCH expression solely from normalized lexical query tokens.
+
+    With prefix each term becomes a prefix query so morphology the analyzer
+    does not stem (e.g. myelin vs myelinated) can still match.
+    """
 
     terms = tuple(sorted(set(analyze_fts_query(value).split())))
     if not terms:
         return None
-    return " OR ".join(f'"{token.replace(chr(34), chr(34) * 2)}"' for token in terms)
+    suffix = "*" if prefix else ""
+    return " OR ".join(f'"{token.replace(chr(34), chr(34) * 2)}"{suffix}' for token in terms)
+
+
+def fts_prefix_shared_terms(query: str, text: str, /) -> int:
+    """Count distinct query terms shared with text allowing prefix matches."""
+
+    text_terms = set(analyze_text(text).split())
+    matched = 0
+    for term in set(analyze_fts_query(query).split()):
+        if len(term) < _FTS_PREFIX_MATCH_MIN_LENGTH:
+            continue
+        for candidate in text_terms:
+            if len(candidate) >= _FTS_PREFIX_MATCH_MIN_LENGTH and (
+                candidate.startswith(term) or term.startswith(candidate)
+            ):
+                matched += 1
+                break
+    return matched
 
 
 def admits_fts_text(query: str, text: str, /, *, floor: AdmissionFloor | None = None) -> bool:
@@ -299,5 +322,6 @@ __all__ = [
     "analyze_text",
     "analyze_text_with_spans",
     "fts_match_query",
+    "fts_prefix_shared_terms",
     "fts_query_requirements",
 ]

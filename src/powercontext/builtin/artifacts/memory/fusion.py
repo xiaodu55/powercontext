@@ -23,7 +23,11 @@ from powercontext.builtin.artifacts.memory.models import (
     MemoryHit,
     MemoryMatchedBy,
 )
-from powercontext.builtin.artifacts.search import AdmissionFloor, admits_fts_text
+from powercontext.builtin.artifacts.search import (
+    AdmissionFloor,
+    admits_fts_text,
+    fts_prefix_shared_terms,
+)
 
 _RRF_CONSTANT = 60
 _MIN_SEMANTIC_SIMILARITY = 0.3
@@ -36,12 +40,17 @@ def admit_fts_candidates(
     candidates: Sequence[MemoryChannelHit],
     *,
     admission: AdmissionFloor | None = None,
+    prefix: bool = False,
 ) -> tuple[MemoryChannelHit, ...]:
     """Keep lexical candidates with enough distinct query-term evidence.
 
-    ``admission=None`` reproduces today's behaviour bit for bit.
+    ``admission=None`` reproduces today's behaviour bit for bit. With ``prefix``
+    a single prefix-shared query term admits a candidate; the fallback rescues
+    queries whose morphology the analyzer does not stem.
     """
 
+    if prefix:
+        return tuple(candidate for candidate in candidates if fts_prefix_shared_terms(query, candidate.text) >= 1)
     return tuple(candidate for candidate in candidates if admits_fts_text(query, candidate.text, floor=admission))
 
 

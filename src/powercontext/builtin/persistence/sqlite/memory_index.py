@@ -345,7 +345,7 @@ class SQLiteMemoryFTSIndex:
     ) -> MemorySearchChannels:
         if request.mode not in {"fts", "hybrid"}:
             return MemorySearchChannels()
-        query = fts_match_query(request.query)
+        query = fts_match_query(request.query, prefix=request.fts_prefix_fallback)
         if query is None:
             return MemorySearchChannels()
         rows = (
