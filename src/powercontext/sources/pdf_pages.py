@@ -40,6 +40,8 @@ _SEARCH_POOL_MULTIPLIER = 20
 _QUERY_TOKEN_PATTERN = re.compile(r"[a-z]+|\d+")
 _SEARCH_DIGIT_WEIGHT = 0.3
 _SEARCH_HEADING_BONUS = 0.15
+_SEARCH_WEAK_COVER_THRESHOLD = 0.35
+_SEARCH_WEAK_NEIGHBOR_WINDOW = 8
 _SEARCH_TABLE_FILLER = 5
 _SEARCH_NARRATIVE_FILLER = 2
 _SEARCH_NEIGHBOR_WINDOW = 3
@@ -449,6 +451,11 @@ def _infer_target_document(documents, token_sets, query_tokens, idf, denominator
         for first, second in itertools.pairwise(query_tokens):
             if len(first) + len(second) >= 6 and first + second in flat_document:
                 score += 3
+        # Company names with no standalone words ("3M_2022_10K" flattens to
+        # "3m202210k") survive only as short substrings; a short id prefix
+        # occurring in the flattened question is still a naming signal.
+        if flat_document[:2] and flat_document[:2] not in flat_document[2:] and flat_document[:2] in flat_question:
+            score += 3
         affinity[document_id] = score
     best_affinity = max(affinity.values(), default=0)
     affinity_values = sorted(affinity.values(), reverse=True)
@@ -534,19 +541,27 @@ def _select_page_records(records, scored, keep, densities, target, numeric, limi
         used_pages.add(records[index][1][1])
     if target is not None and len(picked) < limit:
         head_pages = [page for document, page in picked if document == target]
-        picked.extend(_neighbor_filler(records, keep, densities, target, used_pages, head_pages, limit - len(picked)))
+        # Weak lexical anchoring means the question vocabulary never met the
+        # gold page; widen the neighborhood so nearby narrative sections
+        # (legal proceedings, business overview) can still be returned.
+        window = _SEARCH_NEIGHBOR_WINDOW
+        if scored and head:
+            best_coverage = -scored[0][0]
+            if best_coverage < _SEARCH_WEAK_COVER_THRESHOLD:
+                window = _SEARCH_WEAK_NEIGHBOR_WINDOW
+        picked.extend(_neighbor_filler(records, keep, densities, target, used_pages, head_pages, limit - len(picked), window))
     order = {location: rank for rank, location in enumerate(picked)}
     return sorted(records, key=lambda item: order.get(item[1], len(order)))
 
 
-def _neighbor_filler(records, keep, densities, target, used_pages, head_pages, slots) -> list[tuple[str, int]]:
+def _neighbor_filler(records, keep, densities, target, used_pages, head_pages, slots, window=_SEARCH_NEIGHBOR_WINDOW) -> list[tuple[str, int]]:
     """Pages adjacent to the head picks — closer pages first — because
     financial-statement gold pages often sit next to the pages the query
     vocabulary does reach."""
 
     neighbors: set[tuple[int, int]] = set()
     for base_page in head_pages:
-        for delta in range(1, _SEARCH_NEIGHBOR_WINDOW + 1):
+        for delta in range(1, window + 1):
             neighbors.add((delta, base_page - delta))
             neighbors.add((delta, base_page + delta))
     filler: list[tuple[float, tuple[str, int]]] = []
