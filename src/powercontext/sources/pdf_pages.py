@@ -39,8 +39,9 @@ _SEARCH_POOL_FLOOR = 400
 _SEARCH_POOL_MULTIPLIER = 20
 _QUERY_TOKEN_PATTERN = re.compile(r"[a-z]+|\d+")
 _SEARCH_DIGIT_WEIGHT = 0.3
-_SEARCH_TABLE_FILLER = 10
-_SEARCH_NARRATIVE_FILLER = 4
+_SEARCH_HEADING_BONUS = 0.15
+_SEARCH_TABLE_FILLER = 5
+_SEARCH_NARRATIVE_FILLER = 2
 _SEARCH_NEIGHBOR_WINDOW = 3
 _NUMERIC_HINT_TOKENS = frozenset((
     "ratio",
@@ -374,6 +375,7 @@ def _rank_page_records(records, question: str, limit: int) -> list:
     token_sets: list[frozenset[str]] = []
     densities: list[float] = []
     documents: list[str] = []
+    texts: list[str] = []
     for record, (document_id, _page) in records:
         text = record.entry.text
         prefix = f"{document_id}\n"
@@ -385,6 +387,7 @@ def _rank_page_records(records, question: str, limit: int) -> list:
         token_sets.append(frozenset(stripped))
         densities.append(digits / len(stripped) if stripped else 0.0)
         documents.append(document_id)
+        texts.append(text)
     total = len(records)
     query_tokens = _query_tokens(question)
     if not query_tokens:
@@ -398,7 +401,7 @@ def _rank_page_records(records, question: str, limit: int) -> list:
             document_frequency[token] = document_frequency.get(token, 0) + 1
     idf = {token: math.log(1.0 + total / (1.0 + document_frequency.get(token, 0))) for token in query_set}
     denominator = sum(idf[token] for token in query_tokens) or 1.0
-    target = _infer_target_document(documents, token_sets, query_tokens, idf, denominator)
+    target = _infer_target_document(documents, token_sets, query_tokens, idf, denominator, question)
     if target is not None:
         keep = [index for index in range(total) if documents[index] == target]
         # Second pass: idf within the target document, so terms that are
@@ -411,26 +414,38 @@ def _rank_page_records(records, question: str, limit: int) -> list:
         idf = {token: math.log(1.0 + len(keep) / (1.0 + target_frequency.get(token, 0))) for token in query_set}
     else:
         keep = list(range(total))
-    scored = _score_pages(token_sets, densities, idf, query_tokens, keep, numeric)
+    scored = _score_pages(token_sets, densities, idf, query_tokens, keep, numeric, _heading_bonus(question, texts))
     return _select_page_records(records, scored, keep, densities, target, numeric, limit)
 
 
-def _infer_target_document(documents, token_sets, query_tokens, idf, denominator) -> str | None:
+def _infer_target_document(documents, token_sets, query_tokens, idf, denominator, question) -> str | None:
     """Decide the question's target document, or ``None`` when ambiguous.
 
-    Affinity matches question tokens (and adjacent-token concatenations for
-    multi-word names) against the document ids; the per-document mean
-    coverage breaks ties. Only a strictly best affinity narrows retrieval to
-    that document.
+    Affinity matches the question against the document ids: a document-id
+    word that also appears in the flattened question is the strongest
+    signal (the question names that company), question tokens matching a
+    document-id word or the flattened id weigh less, and adjacent-token
+    concatenations catch multi-word names. The per-document mean coverage
+    breaks ties. Only a strictly best affinity narrows retrieval to that
+    document.
     """
 
     affinity: dict[str, int] = {}
+    flat_question = re.sub(r"[^a-z0-9]", "", question.lower())
     for document_id in set(documents):
-        flat_document = re.sub(r"[^a-z0-9]", "", document_id.lower())
+        lowered = document_id.lower()
+        flat_document = re.sub(r"[^a-z0-9]", "", lowered)
+        words = set(re.findall(r"[a-z]+|\d+", lowered))
         score = 0
+        for word in words:
+            if len(word) >= 2 and not word.isdigit() and not re.fullmatch(r"10[kq]", word) and word in flat_question:
+                score += 3
         for token in query_tokens:
-            if len(token) >= 3 and re.search(r"[a-z]", token) and token in flat_document:
-                score += 1
+            if len(token) >= 3 and re.search(r"[a-z]", token):
+                if token in words:
+                    score += 2
+                elif token in flat_document:
+                    score += 1
         for first, second in itertools.pairwise(query_tokens):
             if len(first) + len(second) >= 6 and first + second in flat_document:
                 score += 3
@@ -452,13 +467,51 @@ def _infer_target_document(documents, token_sets, query_tokens, idf, denominator
     )
 
 
-def _score_pages(token_sets, densities, idf, query_tokens, keep, numeric) -> list[tuple[float, float, int]]:
+_STATEMENT_HEADING_SYNONYMS = (
+    (
+        ("balance sheet", "statement of financial position", "financial position"),
+        ("balance sheet",),
+    ),
+    (
+        ("income statement", "statement of income", "statements of income"),
+        (
+            "statements of operations",
+            "statement of operations",
+            "consolidated statements of income",
+            "consolidated statement of income",
+        ),
+    ),
+)
+
+
+def _heading_bonus(question: str, page_texts: list[str]) -> list[float]:
+    """Reward statement pages when the question names the same statement in
+    different words — ``statement of financial position`` vs a page headed
+    ``Balance Sheets`` — because primary statements carry the figures the
+    question asks for even where the phrasing does not overlap."""
+
+    lowered = question.lower()
+    wanted: list[str] = []
+    for triggers, targets in _STATEMENT_HEADING_SYNONYMS:
+        if any(trigger in lowered for trigger in triggers):
+            wanted.extend(targets)
+    if not wanted:
+        return [0.0] * len(page_texts)
+    lowered_texts = [text.lower() for text in page_texts]
+    return [
+        _SEARCH_HEADING_BONUS if any(target in text for target in wanted) else 0.0
+        for text in lowered_texts
+    ]
+
+
+def _score_pages(token_sets, densities, idf, query_tokens, keep, numeric, heading_bonuses) -> list[tuple[float, float, int]]:
     denominator = sum(idf[token] for token in query_tokens) or 1.0
     digit_weight = _SEARCH_DIGIT_WEIGHT if numeric else 0.0
     scored: list[tuple[float, float, int]] = []
     for index in keep:
         coverage = sum(idf[token] for token in query_tokens if token in token_sets[index]) / denominator
-        scored.append((-(coverage + digit_weight * densities[index]), -densities[index], index))
+        score = coverage + digit_weight * densities[index] + heading_bonuses[index]
+        scored.append((-score, -densities[index], index))
     scored.sort()
     return scored
 
